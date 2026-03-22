@@ -1072,15 +1072,6 @@ export default function App() {
   );
   const netH = useMemo(() => Math.max(0.1, grossH - exclH), [grossH, exclH]);
 
-  computeExcluded(tripStart, tripEnd).then(
-    ({ excludedHours, windows, usingFallback }) => {
-      setExclH(excludedHours);
-      setRestWindows(windows); // add this line
-      setZmanimStatus(usingFallback ? "fallback" : "ok");
-      setZmanimLoading(false);
-    },
-  );
-
   // Fetch CityCar prices on mount
   useEffect(() => {
     fetch("/api/citycar")
@@ -1109,8 +1100,9 @@ export default function App() {
     setExclH(fallbackExcluded(tripStart, tripEnd));
 
     computeExcluded(tripStart, tripEnd).then(
-      ({ excludedHours, usingFallback }) => {
+      ({ excludedHours, windows, usingFallback }) => {
         setExclH(excludedHours);
+        setRestWindows(windows); // add this line
         setZmanimStatus(usingFallback ? "fallback" : "ok");
         setZmanimLoading(false);
       },
