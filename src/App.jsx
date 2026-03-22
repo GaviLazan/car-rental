@@ -1,7 +1,16 @@
-import { useState, useMemo, useEffect, useCallback } from "react";
+import { useState, useMemo, useEffect } from "react";
 
-// ── Yom Tov lookup table ──────────────────────────────────────────────────────
-// Each date is the *eve* — YT starts at bein hashmoshos that evening
+// ── Zmanim / rest window helpers ──────────────────────────────────────────────
+function addDays(d, n) {
+  const r = new Date(d);
+  r.setDate(r.getDate() + n);
+  return r;
+}
+function fmtDateKey(d) {
+  const p = (n) => String(n).padStart(2, "0");
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`;
+}
+
 const YT_EVES = {
   2024: [
     "2024-04-22",
@@ -45,33 +54,6 @@ const YT_EVES = {
   ],
 };
 
-function addDays(d, n) {
-  const r = new Date(d);
-  r.setDate(r.getDate() + n);
-  return r;
-}
-function fmtDateKey(d) {
-  const pad = (n) => String(n).padStart(2, "0");
-  return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-}
-
-// ── Zmanim cache ──────────────────────────────────────────────────────────────
-const zmanimCache = {};
-
-async function fetchZmanim(dateStr) {
-  if (zmanimCache[dateStr]) return zmanimCache[dateStr];
-  try {
-    const r = await fetch(`/api/zmanim?date=${dateStr}`);
-    if (!r.ok) throw new Error("zmanim fetch failed");
-    const data = await r.json();
-    zmanimCache[dateStr] = data;
-    return data;
-  } catch {
-    return null;
-  }
-}
-
-// Get all dates in [start, end] that are Shabbat eves or YT eves
 function getRestEves(tripStart, tripEnd) {
   const eves = new Set();
   const cur = new Date(tripStart);
@@ -79,9 +61,7 @@ function getRestEves(tripStart, tripEnd) {
   const scanEnd = addDays(tripEnd, 1);
   while (cur <= scanEnd) {
     const key = fmtDateKey(cur);
-    // Friday = Shabbat eve
     if (cur.getDay() === 5) eves.add(key);
-    // YT eves
     const y = cur.getFullYear();
     if ((YT_EVES[y] || []).includes(key)) eves.add(key);
     cur.setDate(cur.getDate() + 1);
@@ -89,72 +69,7 @@ function getRestEves(tripStart, tripEnd) {
   return [...eves];
 }
 
-// Given zmanim data for eve + next day, build a {start, end} window
-function buildWindow(eveZmanim, nextZmanim, eveDateStr) {
-  if (!eveZmanim || !nextZmanim) return null;
-  const start = new Date(eveZmanim.bein_hashmashos || eveZmanim.sunset);
-  const end = new Date(nextZmanim.tzet || nextZmanim.sunset);
-  if (isNaN(start) || isNaN(end)) return null;
-  return { start, end };
-}
-
-// Main async function: compute excluded hours given trip window
-// Returns { excludedHours, windows, usingFallback }
-async function computeExcluded(tripStart, tripEnd) {
-  const eves = getRestEves(tripStart, tripEnd);
-  const datesToFetch = new Set();
-  eves.forEach((eve) => {
-    datesToFetch.add(eve);
-    datesToFetch.add(fmtDateKey(addDays(new Date(eve), 1)));
-  });
-
-  // Fetch all needed zmanim in parallel
-  const results = await Promise.all(
-    [...datesToFetch].map((d) => fetchZmanim(d).then((z) => [d, z])),
-  );
-  const zmap = Object.fromEntries(results.filter(([, z]) => z));
-  const usingFallback = results.some(([, z]) => !z);
-
-  // Build windows
-  const windows = [];
-  for (const eve of eves) {
-    const nextDay = fmtDateKey(addDays(new Date(eve), 1));
-    const w = buildWindow(zmap[eve], zmap[nextDay], eve);
-    if (w) windows.push(w);
-  }
-
-  // Merge overlapping windows
-  windows.sort((a, b) => a.start - b.start);
-  const merged = [];
-  for (const w of windows) {
-    if (merged.length && w.start <= merged[merged.length - 1].end)
-      merged[merged.length - 1].end = new Date(
-        Math.max(merged[merged.length - 1].end, w.end),
-      );
-    else merged.push({ start: new Date(w.start), end: new Date(w.end) });
-  }
-
-  let ms = 0;
-  const relevantWindows = [];
-  for (const w of merged) {
-    const overlap = Math.max(
-      0,
-      Math.min(tripEnd, w.end) - Math.max(tripStart, w.start),
-    );
-    if (overlap > 0) {
-      ms += overlap;
-      relevantWindows.push(w);
-    }
-  }
-
-  return {
-    excludedHours: ms / 3600000,
-    windows: relevantWindows,
-    usingFallback,
-  };
-}
-
-// Sinusoidal fallback (used while zmanim load)
+// Sinusoidal fallback for Jerusalem sunset
 function sunsetMinutesFallback(date) {
   const doy = Math.round(
     (date - new Date(date.getFullYear(), 0, 0)) / 86400000,
@@ -163,19 +78,65 @@ function sunsetMinutesFallback(date) {
     18 * 60 + 15 - 95 * Math.cos((2 * Math.PI * (doy - 172)) / 365),
   );
 }
-function fallbackExcluded(tripStart, tripEnd) {
+
+const zmanimCache = {};
+async function fetchZmanim(dateStr) {
+  if (zmanimCache[dateStr]) return zmanimCache[dateStr];
+  try {
+    const r = await fetch(`/api/zmanim?date=${dateStr}`);
+    if (!r.ok) throw new Error();
+    const data = await r.json();
+    zmanimCache[dateStr] = data;
+    return data;
+  } catch {
+    return null;
+  }
+}
+
+function buildWindowFromZmanim(eveZmanim, nextZmanim) {
+  if (!eveZmanim || !nextZmanim) return null;
+  const start = new Date(eveZmanim.bein_hashmashos);
+  const end = new Date(nextZmanim.tzet);
+  if (isNaN(start) || isNaN(end)) return null;
+  return { start, end };
+}
+
+function buildWindowFallback(eveDateStr) {
+  const eve = new Date(eveDateStr);
+  const sm = sunsetMinutesFallback(eve) - 18;
+  const nd = addDays(eve, 1);
+  const em = sunsetMinutesFallback(nd) + 50;
+  const s = new Date(eve);
+  s.setHours(Math.floor(sm / 60), sm % 60, 0, 0);
+  const e = new Date(nd);
+  e.setHours(Math.floor(em / 60), em % 60, 0, 0);
+  return { start: s, end: e };
+}
+
+async function computeRestWindows(tripStart, tripEnd) {
   const eves = getRestEves(tripStart, tripEnd);
-  const windows = eves.map((eveDateStr) => {
-    const eve = new Date(eveDateStr);
-    const sm = sunsetMinutesFallback(eve) - 18;
-    const nd = addDays(eve, 1);
-    const em = sunsetMinutesFallback(nd) + 50;
-    const s = new Date(eve);
-    s.setHours(Math.floor(sm / 60), sm % 60, 0, 0);
-    const e = new Date(nd);
-    e.setHours(Math.floor(em / 60), em % 60, 0, 0);
-    return { start: s, end: e };
+  const datesToFetch = new Set();
+  eves.forEach((eve) => {
+    datesToFetch.add(eve);
+    datesToFetch.add(fmtDateKey(addDays(new Date(eve), 1)));
   });
+  const results = await Promise.all(
+    [...datesToFetch].map((d) => fetchZmanim(d).then((z) => [d, z])),
+  );
+  const zmap = Object.fromEntries(results.filter(([, z]) => z));
+  const usingFallback = results.some(([, z]) => !z);
+
+  const windows = [];
+  for (const eve of eves) {
+    const nextDay = fmtDateKey(addDays(new Date(eve), 1));
+    const w =
+      zmap[eve] && zmap[nextDay]
+        ? buildWindowFromZmanim(zmap[eve], zmap[nextDay])
+        : buildWindowFallback(eve);
+    if (w) windows.push(w);
+  }
+
+  // Merge overlapping
   windows.sort((a, b) => a.start - b.start);
   const merged = [];
   for (const w of windows) {
@@ -185,13 +146,84 @@ function fallbackExcluded(tripStart, tripEnd) {
       );
     else merged.push({ start: new Date(w.start), end: new Date(w.end) });
   }
-  let ms = 0;
-  for (const w of merged)
-    ms += Math.max(0, Math.min(tripEnd, w.end) - Math.max(tripStart, w.start));
-  return ms / 3600000;
+  return { windows: merged, usingFallback };
 }
 
-// ── Pricing ───────────────────────────────────────────────────────────────────
+// CityCar/MyCar: flat 24h per overlapping rest window
+function getCCExcludedHours(tripStart, tripEnd, windows) {
+  let count = 0;
+  for (const w of windows) {
+    const overlap = Math.min(tripEnd, w.end) - Math.max(tripStart, w.start);
+    if (overlap > 0) count++;
+  }
+  return count * 24;
+}
+
+// Check if a datetime falls inside any rest window
+function isInRestWindow(dt, windows) {
+  return windows.some((w) => dt >= w.start && dt <= w.end);
+}
+
+// ── Seasonal surcharge ────────────────────────────────────────────────────────
+// Parsed from CityCar API seasonHeader/seasonDetails, with hardcoded fallback
+const FALLBACK_SEASONS = [
+  {
+    start: new Date("2026-03-29T00:00:00"),
+    end: new Date("2026-04-09T23:59:59"),
+    hourRate: 3,
+    dayRate: 50,
+  },
+];
+
+function parseSeasonFromAPI(cat) {
+  try {
+    // seasonHeader: "בין התאריכים י\"א ניסן 29/03/2026 עד וכולל כ\"ב ניסן 09/04/2026\nתחול תוספת עונה:"
+    // seasonDetails: "לשעה: ₪3 | יומי, שבועי, חודשי: ₪50 ליום"
+    if (!cat.seasonHeader || !cat.seasonDetails) return null;
+    const dateMatch = cat.seasonHeader.match(
+      /(\d{2}\/\d{2}\/\d{4}).*?(\d{2}\/\d{2}\/\d{4})/,
+    );
+    if (!dateMatch) return null;
+    const [d1, m1, y1] = dateMatch[1].split("/");
+    const [d2, m2, y2] = dateMatch[2].split("/");
+    const start = new Date(`${y1}-${m1}-${d1}T00:00:00`);
+    const end = new Date(`${y2}-${m2}-${d2}T23:59:59`);
+    const hourMatch = cat.seasonDetails.match(/₪(\d+(?:\.\d+)?)/);
+    const dayMatch = cat.seasonDetails.match(/₪(\d+(?:\.\d+)?)\s*ליום/);
+    if (!hourMatch || !dayMatch) return null;
+    return {
+      start,
+      end,
+      hourRate: parseFloat(hourMatch[1]),
+      dayRate: parseFloat(dayMatch[1]),
+    };
+  } catch {
+    return null;
+  }
+}
+
+function getSeasonSurcharge(tripStart, tripEnd, netH, seasons, mode) {
+  // mode: "hourly" | "daily" | "weekly" | "monthly"
+  if (!seasons || !seasons.length) return 0;
+  let total = 0;
+  for (const s of seasons) {
+    const overlapStart = new Date(Math.max(tripStart, s.start));
+    const overlapEnd = new Date(Math.min(tripEnd, s.end));
+    if (overlapEnd <= overlapStart) continue;
+    const overlapH = (overlapEnd - overlapStart) / 3600000;
+    if (mode === "hourly") {
+      total += overlapH * s.hourRate;
+    } else {
+      // daily/weekly/monthly: surcharge per day overlapping
+      // Count calendar days that overlap
+      const days = Math.ceil(overlapH / 24);
+      total += days * s.dayRate;
+    }
+  }
+  return total;
+}
+
+// ── Pricing data ──────────────────────────────────────────────────────────────
 const SZ = { s: "small", f: "family", l: "large" };
 
 const CC_CATS_DEFAULT = [
@@ -212,6 +244,7 @@ const CC_CATS_DEFAULT = [
     kd: 1.0,
     kw: 0.95,
     km2: 0.9,
+    seasons: FALLBACK_SEASONS,
   },
   {
     name: "Small G",
@@ -230,6 +263,7 @@ const CC_CATS_DEFAULT = [
     kd: 1.0,
     kw: 0.95,
     km2: 0.9,
+    seasons: FALLBACK_SEASONS,
   },
   {
     name: "Spacious",
@@ -248,6 +282,7 @@ const CC_CATS_DEFAULT = [
     kd: 1.0,
     kw: 0.95,
     km2: 0.9,
+    seasons: FALLBACK_SEASONS,
   },
   {
     name: "Family",
@@ -266,6 +301,7 @@ const CC_CATS_DEFAULT = [
     kd: 1.0,
     kw: 0.95,
     km2: 0.9,
+    seasons: FALLBACK_SEASONS,
   },
   {
     name: "Family+",
@@ -284,6 +320,7 @@ const CC_CATS_DEFAULT = [
     kd: 1.1,
     kw: 1.0,
     km2: 0.9,
+    seasons: FALLBACK_SEASONS,
   },
   {
     name: "Electric",
@@ -300,6 +337,7 @@ const CC_CATS_DEFAULT = [
     kd: 0.65,
     kw: 0.55,
     km2: 0.45,
+    seasons: FALLBACK_SEASONS,
   },
   {
     name: "Minivan P",
@@ -317,6 +355,7 @@ const CC_CATS_DEFAULT = [
     kd: 1.6,
     kw: 1.3,
     km2: 1.0,
+    seasons: FALLBACK_SEASONS,
   },
   {
     name: "Minivan S",
@@ -334,6 +373,7 @@ const CC_CATS_DEFAULT = [
     kd: 1.6,
     kw: 1.45,
     km2: 1.3,
+    seasons: FALLBACK_SEASONS,
   },
   {
     name: "VIP Minivan",
@@ -351,6 +391,7 @@ const CC_CATS_DEFAULT = [
     kd: 1.75,
     kw: 1.55,
     km2: 1.35,
+    seasons: FALLBACK_SEASONS,
   },
   {
     name: "9 seater",
@@ -368,15 +409,14 @@ const CC_CATS_DEFAULT = [
     kd: 1.75,
     kw: 1.55,
     km2: 1.35,
+    seasons: FALLBACK_SEASONS,
   },
 ];
 
-// Parse CityCar API response into our internal format
 function parseCityCar(apiData) {
   try {
     const cats = apiData.carCategoriesDetails;
     if (!cats) return null;
-    const result = [];
     const NAME_MAP = {
       "קטן E": "Small E",
       "קטן G": "Small G",
@@ -402,45 +442,42 @@ function parseCityCar(apiData) {
       "9 seater": SZ.l,
     };
     const ELEC = new Set(["Electric"]);
-
+    const result = [];
     cats.forEach((cat) => {
       const engName = NAME_MAP[cat.categoryName];
       if (!engName) return;
-      // Use first model's prices (all models in a category share prices)
       const model = cat.models[0];
       if (!model) return;
-      const priceByRoute = {};
+      const byRoute = {};
       model.prices.forEach((p) => {
-        priceByRoute[p.routeID] = p;
+        byRoute[p.routeID] = p;
       });
-      const hourlyRoute = priceByRoute[1];
-      const dailyRoute = priceByRoute[3];
-      const weeklyRoute = priceByRoute[6];
-      const monthlyRoute = priceByRoute[7];
-      if (!hourlyRoute) return;
-
-      // Build km tiers from hourlyRoute.kmPrices
-      const rawTiers = (hourlyRoute.kmPrices || []).sort(
-        (a, b) => a.fromKM - b.fromKM,
-      );
-      const tiers = rawTiers.map((t) => ({
-        to: t.toKM >= 999000 ? 1e9 : t.toKM,
-        p: t.price,
-        mx: t.maxPrice,
-      }));
-
+      const h = byRoute[1],
+        d = byRoute[3],
+        w = byRoute[6],
+        mo = byRoute[7];
+      if (!h) return;
+      const tiers = (h.kmPrices || [])
+        .sort((a, b) => a.fromKM - b.fromKM)
+        .map((t) => ({
+          to: t.toKM >= 999000 ? 1e9 : t.toKM,
+          p: t.price,
+          mx: t.maxPrice,
+        }));
+      const season = parseSeasonFromAPI(model);
       result.push({
         name: engName,
         sz: SZ_MAP[engName] || SZ.f,
         electric: ELEC.has(engName),
-        hourly: hourlyRoute.price,
-        daily: dailyRoute?.price || 0,
-        weekly: weeklyRoute?.price || 0,
-        monthly: monthlyRoute?.price || 0,
+        hourly: h.price,
+        daily: d?.price || 0,
+        weekly: w?.price || 0,
+        monthly: mo?.price || 0,
         tiers,
-        kd: dailyRoute?.kmPrices?.[0]?.price || 1.0,
-        kw: weeklyRoute?.kmPrices?.[0]?.price || 0.95,
-        km2: monthlyRoute?.kmPrices?.[0]?.price || 0.9,
+        kd: d?.kmPrices?.[0]?.price || 1.0,
+        kw: w?.kmPrices?.[0]?.price || 0.95,
+        km2: mo?.kmPrices?.[0]?.price || 0.9,
+        seasons: season ? [season] : FALLBACK_SEASONS,
       });
     });
     return result.length > 0 ? result : null;
@@ -528,6 +565,7 @@ const SS_CATS = [
   },
 ];
 
+// ── Cost calculators ──────────────────────────────────────────────────────────
 function ccKmCost(tiers, km) {
   const t = tiers.find((t) => km <= t.to);
   const raw = km * t.p;
@@ -537,76 +575,139 @@ function ccKmCost(tiers, km) {
     capped: t.mx !== null && raw > t.mx,
   };
 }
-function calcCC(cat, h, km) {
-  const d = Math.ceil(h / 24),
-    w = Math.ceil(h / 168),
-    mo = Math.ceil(h / 720);
+
+function fmtBookingEnd(tripStart, addHours) {
+  const d = new Date(tripStart.getTime() + addHours * 3600000);
+  const p = (n) => String(n).padStart(2, "0");
+  return `${p(d.getDate())}/${p(d.getMonth() + 1)} ${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+function calcCC(cat, netH, km, tripStart, tripEnd) {
+  const fullDays = Math.floor(netH / 24);
+  const remH = netH - fullDays * 24;
+  const weeks = Math.ceil(netH / 168);
+  const months = Math.ceil(netH / 720);
   const { cost: kh, rate: khr, capped } = ccKmCost(cat.tiers, km);
   const kmH = capped ? `${km}km @ ₪${khr} (capped)` : `${km}km @ ₪${khr}`;
+
+  const surch_h = getSeasonSurcharge(
+    tripStart,
+    tripEnd,
+    netH,
+    cat.seasons,
+    "hourly",
+  );
+  const surch_d = getSeasonSurcharge(
+    tripStart,
+    tripEnd,
+    netH,
+    cat.seasons,
+    "daily",
+  );
+  const surch_w = getSeasonSurcharge(
+    tripStart,
+    tripEnd,
+    netH,
+    cat.seasons,
+    "weekly",
+  );
+  const surch_mo = getSeasonSurcharge(
+    tripStart,
+    tripEnd,
+    netH,
+    cat.seasons,
+    "monthly",
+  );
+
+  const hourlyTimeCost = netH * cat.hourly;
+  const dailyTimeCost = fullDays * cat.daily + remH * cat.hourly;
+  const weeklyTimeCost = weeks * cat.weekly + 0; // weekly has no partial hours charge
+  const monthlyTimeCost = months * cat.monthly;
+
+  // Booking end times
+  const endDaily = fmtBookingEnd(tripStart, fullDays * 24 + remH);
+  const endWeekly = fmtBookingEnd(tripStart, weeks * 168);
+  const endMonthly = fmtBookingEnd(tripStart, months * 720);
+
+  const surchDetailH = surch_h > 0 ? ` + ₪${surch_h.toFixed(0)} season` : "";
+  const surchDetailD = surch_d > 0 ? ` + ₪${surch_d.toFixed(0)} season` : "";
+  const surchDetailW = surch_w > 0 ? ` + ₪${surch_w.toFixed(0)} season` : "";
+  const surchDetailMo = surch_mo > 0 ? ` + ₪${surch_mo.toFixed(0)} season` : "";
+
+  const remDetail = remH > 0 ? ` + ${remH.toFixed(1)}h @ ₪${cat.hourly}` : "";
+
   return [
     {
       label: "Hourly",
-      cost: h * cat.hourly + kh,
+      cost: hourlyTimeCost + kh + surch_h,
       kmRate: khr,
-      detail: `₪${cat.hourly}/h × ${h.toFixed(1)}h · ${kmH}`,
+      detail: `₪${cat.hourly}/h × ${netH.toFixed(1)}h${surchDetailH} · ${kmH}`,
     },
     {
       label: "Daily",
-      cost: d * cat.daily + km * cat.kd,
+      cost: dailyTimeCost + km * cat.kd + surch_d,
       kmRate: cat.kd,
-      detail: `₪${cat.daily}/day × ${d}d · ${km}km @ ₪${cat.kd}`,
+      detail: `₪${cat.daily}/day × ${fullDays}d${remDetail}${surchDetailD} · ${km}km @ ₪${cat.kd} → book until ${endDaily}`,
     },
     {
       label: "Weekly",
-      cost: w * cat.weekly + km * cat.kw,
+      cost: weeklyTimeCost + km * cat.kw + surch_w,
       kmRate: cat.kw,
-      detail: `₪${cat.weekly}/wk × ${w}wk · ${km}km @ ₪${cat.kw}`,
+      detail: `₪${cat.weekly}/wk × ${weeks}wk${surchDetailW} · ${km}km @ ₪${cat.kw} → book until ${endWeekly}`,
     },
     {
       label: "Monthly",
-      cost: mo * cat.monthly + km * cat.km2,
+      cost: monthlyTimeCost + km * cat.km2 + surch_mo,
       kmRate: cat.km2,
-      detail: `₪${cat.monthly}/mo × ${mo}mo · ${km}km @ ₪${cat.km2}`,
+      detail: `₪${cat.monthly}/mo × ${months}mo${surchDetailMo} · ${km}km @ ₪${cat.km2} → book until ${endMonthly}`,
     },
   ];
 }
-function calcMC(cat, h, km) {
-  const d = Math.ceil(h / 24);
+
+function calcMC(cat, netH, km, tripStart) {
+  const fullDays = Math.floor(netH / 24);
+  const remH = netH - fullDays * 24;
+  const endDaily = fmtBookingEnd(tripStart, fullDays * 24 + remH);
+  const remDetail = remH > 0 ? ` + ${remH.toFixed(1)}h @ ₪${cat.hourly}` : "";
   return [
     {
       label: "Hourly",
-      cost: h * cat.hourly + km * cat.kh,
+      cost: netH * cat.hourly + km * cat.kh,
       kmRate: cat.kh,
-      detail: `₪${cat.hourly}/h × ${h.toFixed(1)}h · ${km}km @ ₪${cat.kh}`,
+      detail: `₪${cat.hourly}/h × ${netH.toFixed(1)}h · ${km}km @ ₪${cat.kh}`,
     },
     {
       label: "Daily",
-      cost: d * cat.daily + km * cat.kd,
+      cost: fullDays * cat.daily + remH * cat.hourly + km * cat.kd,
       kmRate: cat.kd,
-      detail: `₪${cat.daily}/day × ${d}d · ${km}km @ ₪${cat.kd}`,
+      detail: `₪${cat.daily}/day × ${fullDays}d${remDetail} · ${km}km @ ₪${cat.kd} → book until ${endDaily}`,
     },
   ];
 }
-function calcSS(cat, h, km) {
-  const base = h <= 3 ? cat.h3 : cat.h3 + (h - 3) * cat.hx;
-  const d = Math.ceil(h / 24),
-    xkm = Math.max(0, km - cat.kfree * d);
+
+function calcSS(cat, grossH, km, tripStart) {
+  const base = grossH <= 3 ? cat.h3 : cat.h3 + (grossH - 3) * cat.hx;
+  const fullDays = Math.floor(grossH / 24);
+  const remH = grossH - fullDays * 24;
+  const xkm = Math.max(0, km - cat.kfree * Math.ceil(grossH / 24));
   const freeNote =
     xkm === 0
       ? `${km}km (all incl.)`
-      : `${km}km (${cat.kfree * d} incl. + ${xkm} @ ₪${cat.kr})`;
+      : `${km}km (${cat.kfree * Math.ceil(grossH / 24)} incl. + ${xkm} @ ₪${cat.kr})`;
+  const endDaily = fmtBookingEnd(tripStart, fullDays * 24 + remH);
+  const remDetail = remH > 0 ? ` + ${remH.toFixed(1)}h @ ₪${cat.hx}` : "";
   return [
     {
       label: "Hourly",
       cost: base + km * cat.kr,
       kmRate: cat.kr,
-      detail: `₪${cat.h3} (3h)${h > 3 ? ` + ₪${cat.hx}/h × ${(h - 3).toFixed(1)}h` : ""} · ${km}km @ ₪${cat.kr}`,
+      detail: `₪${cat.h3} (3h)${grossH > 3 ? ` + ₪${cat.hx}/h × ${(grossH - 3).toFixed(1)}h` : ""} · ${km}km @ ₪${cat.kr}`,
     },
     {
       label: "Daily",
-      cost: d * cat.daily + xkm * cat.kr,
+      cost: fullDays * cat.daily + remH * cat.hx + xkm * cat.kr,
       kmRate: cat.kr,
-      detail: `₪${cat.daily}/day × ${d}d · ${freeNote}`,
+      detail: `₪${cat.daily}/day × ${fullDays}d${remDetail} · ${freeNote} → book until ${endDaily}`,
     },
   ];
 }
@@ -616,9 +717,9 @@ const fmt = (n) => "₪" + Math.round(n).toLocaleString();
 const pad = (n) => String(n).padStart(2, "0");
 const fmtDate = (d) =>
   `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
-const fmtTime = (d) => `${pad(d.getHours())}:${pad(d.getMinutes())}`;
+const fmtTime = (d) => `${pad(d.getHours())}:00`;
 function fmtHours(h) {
-  if (h < 0.05) return null;
+  if (!h || h < 0.05) return null;
   const hrs = Math.floor(h),
     mins = Math.round((h - hrs) * 60);
   return mins > 0 ? `${hrs}h ${mins}m` : `${hrs}h`;
@@ -650,6 +751,9 @@ const T = {
   warn: "#92400E",
   warnBg: "#FFF7ED",
   warnBorder: "#FED7AA",
+  danger: "#991B1B",
+  dangerBg: "#FEF2F2",
+  dangerBorder: "#FECACA",
 };
 const CO = {
   CityCar: { color: T.citycar, bg: T.citycarBg },
@@ -694,14 +798,14 @@ function Badge({ color, bg, border, children }) {
     </span>
   );
 }
-function InputField({ label, type, value, onChange, min }) {
+function InputField({ label, type, value, onChange, min, readOnly }) {
   return (
     <div style={{ display: "flex", flexDirection: "column", gap: 4 }}>
       <label
         style={{
           fontSize: 11,
           fontWeight: 600,
-          color: T.textSub,
+          color: readOnly ? T.textMuted : T.textSub,
           letterSpacing: "0.04em",
           textTransform: "uppercase",
         }}
@@ -712,18 +816,20 @@ function InputField({ label, type, value, onChange, min }) {
         type={type}
         value={value}
         min={min}
-        onChange={(e) => onChange(e.target.value)}
+        readOnly={readOnly}
+        onChange={(e) => !readOnly && onChange(e.target.value)}
         style={{
           padding: "9px 12px",
           fontSize: 15,
           fontWeight: 500,
           border: `1.5px solid ${T.border}`,
           borderRadius: 8,
-          background: T.surface,
-          color: T.text,
+          background: readOnly ? T.surfaceAlt : T.surface,
+          color: readOnly ? T.textSub : T.text,
           outline: "none",
           width: "100%",
           fontFamily: "inherit",
+          cursor: readOnly ? "not-allowed" : "auto",
         }}
       />
     </div>
@@ -809,7 +915,6 @@ function StatusDot({ status }) {
     </div>
   );
 }
-
 function StatusDot2({ status }) {
   const colors = {
     loading: "#F59E0B",
@@ -845,8 +950,32 @@ function StatusDot2({ status }) {
     </div>
   );
 }
-
-function CompanyCard({ company, best, isOverall, isCheapestKm }) {
+function CompanyCard({ company, best, isOverall, isCheapestKm, blocked }) {
+  if (blocked)
+    return (
+      <div
+        style={{
+          padding: "16px 18px",
+          background: T.dangerBg,
+          border: `1.5px solid ${T.dangerBorder}`,
+          borderRadius: 12,
+        }}
+      >
+        <div
+          style={{
+            fontSize: 12,
+            fontWeight: 700,
+            color: T.danger,
+            marginBottom: 6,
+          }}
+        >
+          {company}
+        </div>
+        <div style={{ fontSize: 12, color: T.danger }}>
+          ⚠ Booking not possible — start or end falls during Shabbat/Yom Tov
+        </div>
+      </div>
+    );
   if (!best)
     return (
       <div
@@ -1039,7 +1168,10 @@ function RankRow({ opt, rank, isCheapestKm }) {
 // ── Main App ──────────────────────────────────────────────────────────────────
 export default function App() {
   const now = new Date();
+  // Round to current hour
+  now.setMinutes(0, 0, 0);
   const later = new Date(now.getTime() + 2 * 3600000);
+
   const [sD, setSd] = useState(fmtDate(now));
   const [sT, setSt] = useState(fmtTime(now));
   const [eD, setEd] = useState(fmtDate(later));
@@ -1048,17 +1180,28 @@ export default function App() {
   const [ccIdx, setCcIdx] = useState(null);
   const [activeCompanies, setActiveCompanies] = useState(new Set(COMPANIES));
   const [hideElectric, setHideElectric] = useState(false);
-  const [restWindows, setRestWindows] = useState([]);
 
-  // CityCar live data
   const [ccCats, setCcCats] = useState(CC_CATS_DEFAULT);
-  const [ccStatus, setCcStatus] = useState("loading"); // loading | ok | error
-  const [ccUpdated, setCcUpdated] = useState("snapshot 22 Mar 2026");
+  const [ccStatus, setCcStatus] = useState("loading");
 
-  // Zmanim state
-  const [exclH, setExclH] = useState(0);
+  const [restWindows, setRestWindows] = useState([]);
   const [zmanimStatus, setZmanimStatus] = useState("loading");
   const [zmanimLoading, setZmanimLoading] = useState(false);
+
+  // Round start time to hour on change
+  function handleStartTime(val) {
+    setSt(val);
+    // Sync end minutes to match start minutes
+    const startMins = val.slice(3, 5);
+    const endHour = eT.slice(0, 3);
+    setEt(endHour + startMins);
+  }
+
+  function handleEndTime(val) {
+    // Lock minutes to match start minutes
+    const startMins = sT.slice(3, 5);
+    setEt(val.slice(0, 3) + startMins);
+  }
 
   const tripStart = useMemo(() => new Date(`${sD}T${sT}`), [sD, sT]);
   const tripEnd = useMemo(() => new Date(`${eD}T${eT}`), [eD, eT]);
@@ -1070,9 +1213,28 @@ export default function App() {
     () => (valid ? (tripEnd - tripStart) / 3600000 : 0),
     [tripStart, tripEnd, valid],
   );
-  const netH = useMemo(() => Math.max(0.1, grossH - exclH), [grossH, exclH]);
 
-  // Fetch CityCar prices on mount
+  // Flat 24h per rest window for CC/MC
+  const ccExclH = useMemo(
+    () => getCCExcludedHours(tripStart, tripEnd, restWindows),
+    [tripStart, tripEnd, restWindows],
+  );
+  const netH = useMemo(
+    () => Math.max(0.1, grossH - ccExclH),
+    [grossH, ccExclH],
+  );
+
+  // Warning: start or end in rest window
+  const startBlocked = useMemo(
+    () => valid && isInRestWindow(tripStart, restWindows),
+    [tripStart, restWindows, valid],
+  );
+  const endBlocked = useMemo(
+    () => valid && isInRestWindow(tripEnd, restWindows),
+    [tripEnd, restWindows, valid],
+  );
+  const ccmcBlocked = startBlocked || endBlocked;
+
   useEffect(() => {
     fetch("/api/citycar")
       .then((r) => {
@@ -1084,30 +1246,22 @@ export default function App() {
         if (parsed) {
           setCcCats(parsed);
           setCcStatus("ok");
-          setCcUpdated("live");
-        } else {
-          setCcStatus("error");
-        }
+        } else setCcStatus("error");
       })
       .catch(() => setCcStatus("error"));
   }, []);
 
-  // Fetch zmanim whenever trip window changes
   useEffect(() => {
     if (!valid) return;
     setZmanimLoading(true);
-    // Use fallback immediately while fetching
-    setExclH(fallbackExcluded(tripStart, tripEnd));
-
-    computeExcluded(tripStart, tripEnd).then(
-      ({ excludedHours, windows, usingFallback }) => {
-        setExclH(excludedHours);
-        setRestWindows(windows); // add this line
+    computeRestWindows(tripStart, tripEnd).then(
+      ({ windows, usingFallback }) => {
+        setRestWindows(windows);
         setZmanimStatus(usingFallback ? "fallback" : "ok");
         setZmanimLoading(false);
       },
     );
-  }, [sD, sT, eD, eT, valid]);
+  }, [sD, sT, eD, eT]);
 
   const filterSz = ccIdx !== null ? ccCats[ccIdx]?.sz : null;
 
@@ -1124,47 +1278,29 @@ export default function App() {
   const allOpts = useMemo(() => {
     if (!valid) return [];
     const out = [];
-    if (activeCompanies.has("CityCar")) {
+    if (activeCompanies.has("CityCar") && !ccmcBlocked) {
       ccCats.forEach((c, i) => {
         if (ccIdx !== null && i !== ccIdx) return;
         if (hideElectric && c.electric) return;
-        calcCC(c, netH, km).forEach((o) =>
-          out.push({
-            ...o,
-            company: "CityCar",
-            car: c.name,
-            sz: c.sz,
-            electric: c.electric,
-          }),
+        calcCC(c, netH, km, tripStart, tripEnd).forEach((o) =>
+          out.push({ ...o, company: "CityCar", car: c.name, sz: c.sz }),
         );
       });
     }
-    if (activeCompanies.has("MyCar")) {
+    if (activeCompanies.has("MyCar") && !ccmcBlocked) {
       MC_CATS.forEach((c) => {
         if (filterSz && c.sz !== filterSz) return;
         if (hideElectric && c.electric) return;
-        calcMC(c, netH, km).forEach((o) =>
-          out.push({
-            ...o,
-            company: "MyCar",
-            car: c.name,
-            sz: c.sz,
-            electric: c.electric,
-          }),
+        calcMC(c, netH, km, tripStart).forEach((o) =>
+          out.push({ ...o, company: "MyCar", car: c.name, sz: c.sz }),
         );
       });
     }
     if (activeCompanies.has("Shlomo Share")) {
       SS_CATS.forEach((c) => {
         if (filterSz && c.sz !== filterSz) return;
-        calcSS(c, grossH, km).forEach((o) =>
-          out.push({
-            ...o,
-            company: "Shlomo Share",
-            car: c.name,
-            sz: c.sz,
-            electric: false,
-          }),
+        calcSS(c, grossH, km, tripStart).forEach((o) =>
+          out.push({ ...o, company: "Shlomo Share", car: c.name, sz: c.sz }),
         );
       });
     }
@@ -1179,6 +1315,9 @@ export default function App() {
     activeCompanies,
     hideElectric,
     ccCats,
+    ccmcBlocked,
+    tripStart,
+    tripEnd,
   ]);
 
   const top5 = allOpts.slice(0, 5);
@@ -1195,6 +1334,8 @@ export default function App() {
     return Math.min(...allOpts.map((o) => o.kmRate).filter((r) => r != null));
   }, [allOpts, km]);
 
+  const exclStr = fmtHours(ccExclH);
+
   const pillStyle = (active) => ({
     padding: "6px 13px",
     fontSize: 12,
@@ -1207,7 +1348,7 @@ export default function App() {
     fontFamily: "inherit",
   });
 
-  const exclStr = fmtHours(exclH);
+  const visibleCompanies = COMPANIES.filter((co) => activeCompanies.has(co));
 
   return (
     <div
@@ -1236,7 +1377,7 @@ export default function App() {
           <div
             style={{
               display: "flex",
-              gap: 12,
+              gap: 8,
               alignItems: "center",
               flexWrap: "wrap",
             }}
@@ -1300,7 +1441,7 @@ export default function App() {
               label="Start time"
               type="time"
               value={sT}
-              onChange={setSt}
+              onChange={handleStartTime}
             />
             <InputField
               label="End date"
@@ -1312,7 +1453,7 @@ export default function App() {
               label="End time"
               type="time"
               value={eT}
-              onChange={setEt}
+              onChange={handleEndTime}
             />
             <InputField
               label="Kilometers"
@@ -1322,6 +1463,36 @@ export default function App() {
               min={0}
             />
           </div>
+
+          {/* Shabbat/YT warning */}
+          {valid && ccmcBlocked && (
+            <div
+              style={{
+                padding: "9px 14px",
+                borderRadius: 8,
+                fontSize: 12,
+                lineHeight: 1.6,
+                background: T.dangerBg,
+                border: `1px solid ${T.dangerBorder}`,
+                color: T.danger,
+                marginBottom: 10,
+              }}
+            >
+              <strong>
+                ⚠{" "}
+                {startBlocked && endBlocked
+                  ? "Start and end times fall"
+                  : startBlocked
+                    ? "Start time falls"
+                    : "End time falls"}{" "}
+                during Shabbat or Yom Tov
+              </strong>{" "}
+              — CityCar and MyCar bookings are not possible. Shlomo Share
+              results still shown below.
+            </div>
+          )}
+
+          {/* Window info */}
           {valid && (
             <div
               style={{
@@ -1336,70 +1507,39 @@ export default function App() {
             >
               {exclStr ? (
                 <>
-                  <strong>{exclStr}</strong> Shabbat/Yom Tov excluded
-                  {zmanimLoading ? " (calculating…)" : ""} — CityCar &amp;
-                  MyCar: <strong>{fmtHours(netH) || "< 1m"} net</strong> ·
-                  Shlomo Share: <strong>{fmtHours(grossH)} gross</strong>{" "}
-                  (Shabbat charged)
+                  <strong>{exclStr}</strong> Shabbat/Yom Tov excluded (flat 24h
+                  each){zmanimLoading ? " — calculating…" : ""} — CityCar &amp;
+                  MyCar: <strong>{fmtHours(netH) || "< 1h"} net</strong> ·
+                  Shlomo Share: <strong>{fmtHours(grossH)} gross</strong>
                 </>
               ) : (
                 <>
                   Window: <strong>{fmtHours(grossH)}</strong>
-                  {zmanimLoading ? " (checking zmanim…)" : ""} — no Shabbat or
+                  {zmanimLoading ? " — checking zmanim…" : ""} — no Shabbat or
                   Yom Tov in this window
                 </>
               )}
             </div>
           )}
+
+          {/* Shabbat window debug */}
+          {/* {valid && restWindows.length > 0 && (
+            <details style={{ marginTop:8 }}>
+              <summary style={{ fontSize:11, color:T.accentText, cursor:"pointer" }}>Show Shabbat/Yom Tov windows</summary>
+              <div style={{ marginTop:6, display:"flex", flexDirection:"column", gap:4 }}>
+                {restWindows.map((w,i) => (
+                  <div key={i} style={{ fontSize:11, color:T.textSub, padding:"4px 8px", background:T.surfaceAlt, borderRadius:6 }}>
+                    {w.start.toLocaleString("he-IL", { weekday:"short", month:"short", day:"numeric", hour:"2-digit", minute:"2-digit" })}
+                    {" → "}
+                    {w.end.toLocaleString("he-IL", { weekday:"short", day:"numeric", hour:"2-digit", minute:"2-digit" })}
+                  </div>
+                ))}
+              </div>
+            </details>
+          )} */}
         </div>
 
-        {valid && exclStr && (
-          <details style={{ marginTop: 8 }}>
-            <summary
-              style={{ fontSize: 11, color: T.accentText, cursor: "pointer" }}
-            >
-              Show Shabbat/Yom Tov windows
-            </summary>
-            <div
-              style={{
-                marginTop: 6,
-                display: "flex",
-                flexDirection: "column",
-                gap: 4,
-              }}
-            >
-              {restWindows.map((w, i) => (
-                <div
-                  key={i}
-                  style={{
-                    fontSize: 11,
-                    color: T.textSub,
-                    padding: "4px 8px",
-                    background: T.surfaceAlt,
-                    borderRadius: 6,
-                  }}
-                >
-                  {w.start.toLocaleString("he-IL", {
-                    weekday: "short",
-                    month: "short",
-                    day: "numeric",
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
-                  {" → "}
-                  {w.end.toLocaleString("he-IL", {
-                    weekday: "short",
-                    day: "numeric",
-                    hour: "2-digit",
-                    minute: "2-digit",
-                  })}
-                </div>
-              ))}
-            </div>
-          </details>
-        )}
-
-        {/* Filters card */}
+        {/* Filters */}
         <div
           style={{
             background: T.surface,
@@ -1490,7 +1630,7 @@ export default function App() {
         </div>
 
         {/* Results */}
-        {valid && top5.length > 0 && (
+        {valid && (top5.length > 0 || ccmcBlocked) && (
           <>
             <Label>Best per company</Label>
             <div
@@ -1501,49 +1641,52 @@ export default function App() {
                 marginBottom: 20,
               }}
             >
-              {[...activeCompanies]
-                .filter((co) => COMPANIES.includes(co))
-                .map((co) => (
-                  <CompanyCard
-                    key={co}
-                    company={co}
-                    best={bestCo[co]}
-                    isOverall={
-                      bestCo[co] &&
-                      Math.round(bestCo[co].cost) ===
-                        Math.round(overallBestCost)
-                    }
-                    isCheapestKm={
-                      cheapestKmRate !== null &&
-                      bestCo[co] &&
-                      bestCo[co].kmRate === cheapestKmRate
-                    }
-                  />
-                ))}
-            </div>
-
-            <Label>
-              Top 5{ccIdx !== null ? ` — ${ccCats[ccIdx]?.name} size` : ""}
-            </Label>
-            <div
-              style={{
-                display: "flex",
-                flexDirection: "column",
-                gap: 8,
-                marginBottom: 20,
-              }}
-            >
-              {top5.map((o, i) => (
-                <RankRow
-                  key={i}
-                  opt={o}
-                  rank={i + 1}
+              {visibleCompanies.map((co) => (
+                <CompanyCard
+                  key={co}
+                  company={co}
+                  best={bestCo[co]}
+                  blocked={ccmcBlocked && (co === "CityCar" || co === "MyCar")}
+                  isOverall={
+                    !ccmcBlocked &&
+                    bestCo[co] &&
+                    Math.round(bestCo[co].cost) === Math.round(overallBestCost)
+                  }
                   isCheapestKm={
-                    cheapestKmRate !== null && o.kmRate === cheapestKmRate
+                    cheapestKmRate !== null &&
+                    bestCo[co] &&
+                    bestCo[co].kmRate === cheapestKmRate
                   }
                 />
               ))}
             </div>
+
+            {top5.length > 0 && (
+              <>
+                <Label>
+                  Top 5{ccIdx !== null ? ` — ${ccCats[ccIdx]?.name} size` : ""}
+                </Label>
+                <div
+                  style={{
+                    display: "flex",
+                    flexDirection: "column",
+                    gap: 8,
+                    marginBottom: 20,
+                  }}
+                >
+                  {top5.map((o, i) => (
+                    <RankRow
+                      key={i}
+                      opt={o}
+                      rank={i + 1}
+                      isCheapestKm={
+                        cheapestKmRate !== null && o.kmRate === cheapestKmRate
+                      }
+                    />
+                  ))}
+                </div>
+              </>
+            )}
 
             <div
               style={{
@@ -1556,20 +1699,20 @@ export default function App() {
                 borderRadius: 10,
               }}
             >
-              <strong>CityCar</strong>: {ccUpdated} · <strong>MyCar</strong>:
-              mycar-israel.com 22 Mar 2026 · <strong>Shlomo Share</strong>: app
-              screenshot 22 Mar 2026
+              <strong>CityCar</strong>:{" "}
+              {ccStatus === "ok" ? "live" : "snapshot 22 Mar 2026"} ·{" "}
+              <strong>MyCar</strong>: mycar-israel.com 22 Mar 2026 ·{" "}
+              <strong>Shlomo Share</strong>: app screenshot 22 Mar 2026
               <br />
-              Shabbat/Yom Tov times:{" "}
-              {zmanimStatus === "ok"
-                ? "Hebcal zmanim API (exact)"
-                : "approximated"}{" "}
-              · Chol HaMoed = regular days
+              Zmanim:{" "}
+              {zmanimStatus === "ok" ? "Hebcal API (exact)" : "approximated"} ·
+              CityCar/MyCar deduct flat 24h per Shabbat/YT · Chol HaMoed =
+              regular days
             </div>
           </>
         )}
 
-        {valid && top5.length === 0 && (
+        {valid && top5.length === 0 && !ccmcBlocked && (
           <div
             style={{
               padding: "20px",
