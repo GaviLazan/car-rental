@@ -203,7 +203,6 @@ function parseSeasonFromAPI(cat) {
 }
 
 function getSeasonSurcharge(tripStart, tripEnd, netH, seasons, mode) {
-  // mode: "hourly" | "daily" | "weekly" | "monthly"
   if (!seasons || !seasons.length) return 0;
   let total = 0;
   for (const s of seasons) {
@@ -211,11 +210,12 @@ function getSeasonSurcharge(tripStart, tripEnd, netH, seasons, mode) {
     const overlapEnd = new Date(Math.min(tripEnd, s.end));
     if (overlapEnd <= overlapStart) continue;
     const overlapH = (overlapEnd - overlapStart) / 3600000;
-    if (mode === "hourly") {
-      total += overlapH * s.hourRate;
+    if (mode === "hourly" || mode === "daily") {
+      // Per overlapping day (ceil), plus per remaining hour
+      const overlapFullDays = Math.floor(overlapH / 24);
+      const overlapRemH = overlapH % 24;
+      total += overlapFullDays * s.dayRate + overlapRemH * s.hourRate;
     } else {
-      // daily/weekly/monthly: surcharge per day overlapping
-      // Count calendar days that overlap
       const days = Math.ceil(overlapH / 24);
       total += days * s.dayRate;
     }
@@ -584,20 +584,14 @@ function fmtBookingEnd(tripStart, addHours) {
 
 function calcCC(cat, netH, km, tripStart, tripEnd) {
   const fullDays = Math.floor(netH / 24);
-  const remH = netH - fullDays * 24;
+  const remH = netH % 24;
   const weeks = Math.ceil(netH / 168);
   const months = Math.ceil(netH / 720);
-  const { cost: kh, rate: khr, capped } = ccKmCost(cat.tiers, km);
-  const kmH = capped ? `${km}km @ ₪${khr} (capped)` : `${km}km @ ₪${khr}`;
 
-  const surch_h = getSeasonSurcharge(
-    tripStart,
-    tripEnd,
-    netH,
-    cat.seasons,
-    "hourly",
-  );
-  const surch_d = getSeasonSurcharge(
+  // Time cost is identical for hourly and daily — only km rate differs
+  const timeCost = fullDays * cat.daily + remH * cat.hourly;
+
+  const surch_hd = getSeasonSurcharge(
     tripStart,
     tripEnd,
     netH,
@@ -619,45 +613,39 @@ function calcCC(cat, netH, km, tripStart, tripEnd) {
     "monthly",
   );
 
-  const hourlyTimeCost = netH * cat.hourly;
-  const dailyTimeCost = fullDays * cat.daily + remH * cat.hourly;
-  const weeklyTimeCost = weeks * cat.weekly + 0; // weekly has no partial hours charge
-  const monthlyTimeCost = months * cat.monthly;
+  const { cost: kh, rate: khr, capped } = ccKmCost(cat.tiers, km);
+  const kmH = capped ? `${km}km @ ₪${khr} (capped)` : `${km}km @ ₪${khr}`;
 
-  // Booking end times
-  const endDaily = fmtBookingEnd(tripStart, fullDays * 24 + remH);
-  const endWeekly = fmtBookingEnd(tripStart, weeks * 168);
-  const endMonthly = fmtBookingEnd(tripStart, months * 720);
-
-  const surchDetailH = surch_h > 0 ? ` + ₪${surch_h.toFixed(0)} season` : "";
-  const surchDetailD = surch_d > 0 ? ` + ₪${surch_d.toFixed(0)} season` : "";
+  const timeDetail = `₪${cat.daily}/day × ${fullDays}d${remH > 0 ? ` + ${remH.toFixed(1)}h @ ₪${cat.hourly}` : ""}`;
+  const surchDetail = surch_hd > 0 ? ` + ₪${surch_hd.toFixed(0)} season` : "";
   const surchDetailW = surch_w > 0 ? ` + ₪${surch_w.toFixed(0)} season` : "";
   const surchDetailMo = surch_mo > 0 ? ` + ₪${surch_mo.toFixed(0)} season` : "";
 
-  const remDetail = remH > 0 ? ` + ${remH.toFixed(1)}h @ ₪${cat.hourly}` : "";
+  const endWeekly = fmtBookingEnd(tripStart, weeks * 168);
+  const endMonthly = fmtBookingEnd(tripStart, months * 720);
 
   return [
     {
       label: "Hourly",
-      cost: hourlyTimeCost + kh + surch_h,
+      cost: timeCost + kh + surch_hd,
       kmRate: khr,
-      detail: `₪${cat.hourly}/h × ${netH.toFixed(1)}h${surchDetailH} · ${kmH}`,
+      detail: `${timeDetail}${surchDetail} · ${kmH}`,
     },
     {
       label: "Daily",
-      cost: dailyTimeCost + km * cat.kd + surch_d,
+      cost: timeCost + km * cat.kd + surch_hd,
       kmRate: cat.kd,
-      detail: `₪${cat.daily}/day × ${fullDays}d${remDetail}${surchDetailD} · ${km}km @ ₪${cat.kd} → book until ${endDaily}`,
+      detail: `${timeDetail}${surchDetail} · ${km}km @ ₪${cat.kd}`,
     },
     {
       label: "Weekly",
-      cost: weeklyTimeCost + km * cat.kw + surch_w,
+      cost: weeks * cat.weekly + km * cat.kw + surch_w,
       kmRate: cat.kw,
       detail: `₪${cat.weekly}/wk × ${weeks}wk${surchDetailW} · ${km}km @ ₪${cat.kw} → book until ${endWeekly}`,
     },
     {
       label: "Monthly",
-      cost: monthlyTimeCost + km * cat.km2 + surch_mo,
+      cost: months * cat.monthly + km * cat.km2 + surch_mo,
       kmRate: cat.km2,
       detail: `₪${cat.monthly}/mo × ${months}mo${surchDetailMo} · ${km}km @ ₪${cat.km2} → book until ${endMonthly}`,
     },
