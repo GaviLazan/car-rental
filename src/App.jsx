@@ -652,6 +652,27 @@ function calcCC(cat, netH, km, tripStart, tripEnd) {
   ];
 }
 
+function calcMC(cat, netH, km, tripStart) {
+  const fullDays = Math.floor(netH / 24);
+  const remH = netH - fullDays * 24;
+  const endDaily = fmtBookingEnd(tripStart, fullDays * 24 + remH);
+  const remDetail = remH > 0 ? ` + ${remH.toFixed(1)}h @ ₪${cat.hourly}` : "";
+  return [
+    {
+      label: "Hourly",
+      cost: netH * cat.hourly + km * cat.kh,
+      kmRate: cat.kh,
+      detail: `₪${cat.hourly}/h × ${netH.toFixed(1)}h · ${km}km @ ₪${cat.kh}`,
+    },
+    {
+      label: "Daily",
+      cost: fullDays * cat.daily + remH * cat.hourly + km * cat.kd,
+      kmRate: cat.kd,
+      detail: `₪${cat.daily}/day × ${fullDays}d${remDetail} · ${km}km @ ₪${cat.kd} → book until ${endDaily}`,
+    },
+  ];
+}
+
 function calcSS(cat, grossH, km, tripStart) {
   const base = grossH <= 3 ? cat.h3 : cat.h3 + (grossH - 3) * cat.hx;
   const fullDays = Math.floor(grossH / 24);
